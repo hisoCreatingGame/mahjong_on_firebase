@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>テキスト麻雀 Firebase Demo</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; font-size: 16px; }
+        .container { max-width: 800px; margin: auto; }
+        #game-area { border: 1px solid #ccc; padding: 10px; margin-top: 10px; }
+        .hand { background-color: #e0ffe0; padding: 10px; margin-top: 10px; border: 1px solid darkgreen; }
+        #all-discard-piles { margin-top: 15px; }
+        .discard-pile { background-color: #f0f0f0; padding: 8px; margin-bottom: 5px; border: 1px solid #ccc; }
+        input { margin-right: 5px; padding: 5px; }
+        button { padding: 5px 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>テキスト麻雀 Firebase Demo</h1>
+
+    <div id="login-area">
+        <input type="text" id="game-id" placeholder="部屋ID (例: room1)">
+        <input type="text" id="player-name" placeholder="あなたの名前">
+        <button id="join-game">部屋を作成 / 参加する</button>
+    </div>
+
+    <div id="game-area" style="display: none;">
+        <h2 id="game-status"></h2>
+        <button id="start-game" style="display: none;">ゲーム開始 (4人に満たない場合CPUを追加)</button>
+        
+        <div id="all-discard-piles"></div>
+
+        <div class="hand">
+            <strong>あなたの手牌:</strong>
+            <div id="player-hand" style="font-size: 1.2em; letter-spacing: 2px;"></div>
+        </div>
+
+        <div id="player-controls">
+            <button id="draw-button" style="display: none;">山からツモる</button>
+            <div id="discard-area" style="display: none;">
+                <input type="text" id="tile-to-discard" placeholder="捨てる牌を入力 (例: m1)">
+                <button id="discard-button">捨てる</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
+
+<script>
+     const firebaseConfig = {
+    apiKey: "AIzaSyBIaPMSfYGz0BjqHWnHDU0UcIBGScBb4O4",
+    authDomain: "sample-b4fa4.firebaseapp.com",
+    projectId: "sample-b4fa4",
+    storageBucket: "sample-b4fa4.firebasestorage.app",
+    messagingSenderId: "1054433258481",
+    appId: "1:1054433258481:web:bc65888f01ef7820a5b250",
+    measurementId: "G-LJKMXJTTKQ"
+    };   // ▼▼▼ あなたのFirebase設定をここに貼り付け ▼▼▼
+    // ▲▲▲ あなたのFirebase設定をここに貼り付け ▲▲▲
+
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.firestore();
+
+    let currentGameId = null;
+    let currentPlayerName = null;
+    let gameUnsubscribe = null;
+    
+    // ★修正: CPUの連続実行バグを防ぐための変数を変更
+    let lastProcessedTurn = null; 
+    let isProcessing = false;
+
+    // (HTML要素の取得は変更なし)
+    const loginArea = document.getElementById('login-area');
+    const gameArea = document.getElementById('game-area');
+    const joinGameButton = document.getElementById('join-game');
+    const startGameButton = document.getElementById('start-game');
+    const drawButton = document.getElementById('draw-button');
+    const discardButton = document.getElementById('discard-button');
+
+    // (joinGameButton の処理は変更なし)
+    joinGameButton.addEventListener('click', async () => {
+        const gameId = document.getElementById('game-id').value.trim();
+        const playerName = document.getElementById('player-name').value.trim();
+        if (!gameId || !playerName) { alert('部屋IDと名前を入力してください'); return; }
+        currentGameId = gameId;
+        currentPlayerName = playerName;
+        const gameRef = db.collection('games').doc(currentGameId);
+        const gameDoc = await gameRef.get();
+        if (!gameDoc.exists) {
+            await gameRef.set({ players: { [playerName]: { order: 1, type: 'human' } }, gameState: 'waiting', turn: null, discardPiles: {}, wall: [], hands: {} });
+            alert(`${gameId} を作成しました`);
+        } else {
+            const gameData = gameDoc.data();
+            const currentPlayers = gameData.players;
+            if (Object.values(currentPlayers).filter(p => p.type === 'human').length >= 4) { alert('この部屋は満員です'); return; }
+            if (currentPlayers[playerName]) { alert('同じ名前のプレイヤーが既にいます'); return; }
+            const newOrder = Object.keys(currentPlayers).length + 1;
+            await gameRef.update({ [`players.${playerName}`]: { order: newOrder, type: 'human' } });
+            alert(`${gameId} に参加しました`);
+        }
+        loginArea.style.display = 'none';
+        gameArea.style.display = 'block';
+        startListeningToGame();
+    });
+
+    // ★修正: リアルタイム監視のロジックを修正
+    function startListeningToGame() {
+        if (gameUnsubscribe) gameUnsubscribe();
+        gameUnsubscribe = db.collection('games').doc(currentGameId).onSnapshot((doc) => {
+            if (!doc.exists) return;
+            const gameData = doc.data();
+            updateUI(gameData);
+            
+            // ターンが新しくなったかをチェック
+            if (gameData.turn !== lastProcessedTurn) {
+                isProcessing = false; // ロックを解除
+                lastProcessedTurn = gameData.turn;
+            }
+
+            const isMyTurnAsHost = gameData.players[currentPlayerName]?.order === 1;
+            const isCpuTurn = gameData.players[gameData.turn]?.type === 'cpu';
+
+            if (gameData.gameState === 'playing' && isMyTurnAsHost && isCpuTurn && !isProcessing) {
+                isProcessing = true; // 処理をロック
+                setTimeout(() => performCpuTurn(gameData), 1000);
+            }
+        });
+    }
+
+    // ★修正: UI更新処理でツモと打牌のボタン表示を制御
+    function updateUI(gameData) {
+        const statusEl = document.getElementById('game-status');
+        const playerHandEl = document.getElementById('player-hand');
+        const allDiscardPilesEl = document.getElementById('all-discard-piles');
+        const drawButton = document.getElementById('draw-button');
+        const discardArea = document.getElementById('discard-area');
+
+        const playerNames = Object.keys(gameData.players).sort((a,b) => gameData.players[a].order - gameData.players[b].order);
+        statusEl.innerText = `参加者: ${playerNames.join(', ')}`;
+        if (gameData.gameState === 'waiting' && gameData.players[currentPlayerName]?.order === 1) {
+             startGameButton.style.display = 'block';
+        } else {
+             startGameButton.style.display = 'none';
+        }
+
+        allDiscardPilesEl.innerHTML = '';
+        playerNames.forEach(name => {
+            const piles = gameData.discardPiles[name] || [];
+            const pileDiv = document.createElement('div');
+            pileDiv.className = 'discard-pile';
+            pileDiv.innerHTML = `<strong>${name}:</strong> ${piles.join(' ')}`;
+            allDiscardPilesEl.appendChild(pileDiv);
+        });
+
+        if (gameData.gameState === 'playing') {
+            statusEl.innerText = `現在のターン: ${gameData.turn}`;
+            const myHand = gameData.hands[currentPlayerName] || [];
+            playerHandEl.innerText = myHand.sort().join(' ');
+
+            // 操作ボタンの表示制御
+            if (gameData.turn === currentPlayerName) {
+                // 手牌が13枚ならツモ待ち、14枚なら打牌待ち
+                if (myHand.length % 3 === 1) { // 13枚の想定
+                    drawButton.style.display = 'block';
+                    discardArea.style.display = 'none';
+                } else { // 14枚の想定
+                    drawButton.style.display = 'none';
+                    discardArea.style.display = 'block';
+                }
+            } else {
+                drawButton.style.display = 'none';
+                discardArea.style.display = 'none';
+            }
+        }
+    }
+    
+    // (startGameButton の処理は変更なし)
+    startGameButton.addEventListener('click', async () => { /* ... 変更なし ... */ });
+
+    // ★追加: ツモる処理
+    drawButton.addEventListener('click', async () => {
+        const gameRef = db.collection('games').doc(currentGameId);
+        const gameDoc = await gameRef.get();
+        const gameData = gameDoc.data();
+
+        if (gameData.turn !== currentPlayerName) return; // 自分のターンでなければ何もしない
+
+        const wall = gameData.wall;
+        if (wall.length === 0) {
+            alert("山がなくなりました。");
+            await gameRef.update({ gameState: 'finished' });
+            return;
+        }
+
+        const drawnTile = wall.pop();
+        const myHand = gameData.hands[currentPlayerName] || [];
+        myHand.push(drawnTile);
+
+        await gameRef.update({
+            wall: wall,
+            [`hands.${currentPlayerName}`]: myHand
+        });
+    });
+
+    // (performCpuTurn の処理は変更なし)
+    async function performCpuTurn(gameData) { /* ... 変更なし ... */ }
+
+    // (discardButton の処理は変更なし)
+    discardButton.addEventListener('click', async () => { /* ... 変更なし ... */ });
+
+
+    // --- 変更のない関数をここにまとめる ---
+    startGameButton.addEventListener('click', async () => {
+        const gameRef = db.collection('games').doc(currentGameId);
+        const gameDoc = await gameRef.get();
+        if (!gameDoc.exists) { console.error("エラー: ゲームが見つかりません"); return; }
+        const gameData = gameDoc.data();
+        const players = gameData.players;
+        let playerCount = Object.keys(players).length;
+        const updatedPlayers = { ...players };
+        while (playerCount < 4) {
+            playerCount++;
+            const cpuName = `CPU-${playerCount-Object.keys(players).length}`;
+            updatedPlayers[cpuName] = { order: playerCount, type: 'cpu' };
+        }
+        const suits = ['m', 'p', 's'];
+        let wall = [];
+        suits.forEach(suit => { for (let i = 1; i <= 9; i++) { for (let j = 0; j < 4; j++) { wall.push(suit + i); }}});
+        for (let i = wall.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [wall[i], wall[j]] = [wall[j], wall[i]]; }
+        const hands = {};
+        const discardPiles = {};
+        const playerNames = Object.keys(updatedPlayers).sort((a, b) => updatedPlayers[a].order - updatedPlayers[b].order);
+        playerNames.forEach(name => {
+            hands[name] = wall.splice(0, 13);
+            discardPiles[name] = [];
+        });
+        await gameRef.update({ players: updatedPlayers, wall: wall, hands: hands, discardPiles: discardPiles, gameState: 'playing', turn: playerNames[0] });
+    });
+    async function performCpuTurn(gameData) {
+        const cpuName = gameData.turn;
+        if (!cpuName || gameData.players[cpuName]?.type !== 'cpu') { isProcessing = false; return; }
+        const gameRef = db.collection('games').doc(currentGameId);
+        const wall = gameData.wall;
+        if (wall.length === 0) { console.log("山がなくなりました。"); await gameRef.update({ gameState: 'finished' }); isProcessing = false; return; }
+        const drawnTile = wall.pop();
+        const cpuDiscardPile = gameData.discardPiles[cpuName] || [];
+        cpuDiscardPile.push(drawnTile);
+        const playerNames = Object.keys(gameData.players).sort((a, b) => gameData.players[a].order - gameData.players[b].order);
+        const currentTurnIndex = playerNames.indexOf(cpuName);
+        const nextTurnIndex = (currentTurnIndex + 1) % playerNames.length;
+        const nextPlayer = playerNames[nextTurnIndex];
+        await gameRef.update({ wall: wall, [`discardPiles.${cpuName}`]: cpuDiscardPile, turn: nextPlayer });
+    }
+    discardButton.addEventListener('click', async () => {
+        const tile = document.getElementById('tile-to-discard').value.trim();
+        if (!tile) { alert('捨てる牌を入力してください'); return; }
+        const gameRef = db.collection('games').doc(currentGameId);
+        const gameDoc = await gameRef.get();
+        const gameData = gameDoc.data();
+        if (gameData.turn !== currentPlayerName) { alert('あなたのターンではありません'); return; }
+        const myHand = gameData.hands[currentPlayerName];
+        const tileIndex = myHand.indexOf(tile);
+        if (tileIndex === -1) { alert('その牌は持っていません'); return; }
+        myHand.splice(tileIndex, 1);
+        const myNewDiscards = [...gameData.discardPiles[currentPlayerName], tile];
+        const playerNames = Object.keys(gameData.players).sort((a, b) => gameData.players[a].order - gameData.players[b].order);
+        const currentTurnIndex = playerNames.indexOf(currentPlayerName);
+        const nextTurnIndex = (currentTurnIndex + 1) % playerNames.length;
+        const nextPlayer = playerNames[nextTurnIndex];
+        await gameRef.update({ [`hands.${currentPlayerName}`]: myHand, [`discardPiles.${currentPlayerName}`]: myNewDiscards, turn: nextPlayer });
+        document.getElementById('tile-to-discard').value = '';
+    });
+</script>
+</body>
+</html>
+
